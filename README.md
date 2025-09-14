@@ -1,4 +1,4 @@
-# Devopss
+# Devops
 
 # Mi Proyecto 🚀
 Este es el repositorio del proyecto.
