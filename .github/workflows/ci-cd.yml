@@ -90,7 +90,7 @@ jobs:
         with:
           command: test
           args: --severity-threshold=medium --fail-on=all
-          # si quieres fijar tu org: --org=matiasneira1
+          
 
   push_image:
     runs-on: ubuntu-latest
