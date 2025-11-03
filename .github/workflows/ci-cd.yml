@@ -1,0 +1,157 @@
+name: build-test-scan-deploy
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  BASE_URL: http://localhost:8080
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}
+
+      - name: Run container for tests
+        run: |
+          docker run -d --rm --name web -p 8080:80 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}
+          # warmup
+          for i in {1..10}; do
+            if curl -fsSI ${{ env.BASE_URL }} ; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install test deps
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run tests (Playwright)
+        env:
+          BASE_URL: ${{ env.BASE_URL }}
+        run: npx playwright test --reporter=line --trace on
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+
+  snyk_scan:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - name: Snyk test (npm)
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: test
+          args: --severity-threshold=medium --fail-on=all
+
+  push_image:
+    runs-on: ubuntu-latest
+    needs: [build, snyk_scan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy_smoketest:
+    runs-on: ubuntu-latest
+    needs: push_image
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose file (CI)
+        run: |
+          cat > docker-compose.ci.yml <<'YAML'
+          services:
+            web:
+              image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+              ports: ["8080:80"]
+          YAML
+
+      - name: Up
+        run: docker compose -f docker-compose.ci.yml up -d
+
+      - name: Smoke test
+        run: |
+          for i in {1..15}; do
+            if curl -fsSI http://localhost:8080 ; then exit 0; fi
+            echo "Esperando..."; sleep 2
+          done
+          exit 1
+
+      - name: Logs if fail
+        if: failure()
+        run: docker compose -f docker-compose.ci.yml logs --no-color > logs.txt
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-logs
+          path: logs.txt
